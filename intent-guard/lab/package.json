@@ -1,0 +1,9 @@
+{
+  "name": "checkout-cart",
+  "version": "1.0.0",
+  "description": "Demo project for the intent guard lab. Fake, not published.",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}
