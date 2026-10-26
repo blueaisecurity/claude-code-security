@@ -1,9 +1,12 @@
 """Unit and hook-level tests for intent_guard.py. No model calls: the judge is
 replaced by stub_judge.py. The guard refuses a claude program inside the
-project, so the tests copy the stand-in to a folder next to the lab.
+project, so the tests copy the stand-in to a folder next to the lab. Tests of
+the default prompt store use a fake home folder, never the real one.
 Run: python -I harness/test_intent_guard.py"""
+import hashlib
 import importlib.util
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -25,6 +28,7 @@ STUB = os.path.join(OUTSIDE, "stub_judge.py")
 shutil.copy(os.path.join(HARNESS, "stub_judge.py"), STUB)
 CAPTURE = os.path.join(TMP, "capture.json")
 WINDOWS = os.name == "nt"
+REAL_HOME = os.path.expanduser("~")
 
 spec = importlib.util.spec_from_file_location("intent_guard", SCRIPT)
 ig = importlib.util.module_from_spec(spec)
@@ -41,9 +45,9 @@ def clean_env(**extra):
                    or k in ("AI_AGENT", "BAGGAGE", "NoDefaultCurrentDirectoryInExePath"))}
     env.update(CLAUDE_PROJECT_DIR=LAB, INTENT_GUARD_HOME=os.path.join(TMP, "state"),
                INTENT_GUARD_LOG=os.path.join(TMP, "test.log"), INTENT_GUARD_CLAUDE=STUB,
-               STUB_CAPTURE=CAPTURE)
+               INTENT_GUARD_ALERTS=os.path.join(TMP, "state", "alerts.jsonl"), STUB_CAPTURE=CAPTURE)
     env.update(extra)
-    return env
+    return {k: v for k, v in env.items() if v is not None}  # None: the variable is not set
 
 
 def run_hook(payload, **env):
@@ -583,7 +587,7 @@ class Hook(unittest.TestCase):
         self.assertIn("full path of claude.exe", out["systemMessage"])
 
 
-ALERTS = os.path.join(TMP, "state", "alerts.jsonl")  # INTENT_GUARD_HOME is TMP/state in the tests
+ALERTS = os.path.join(TMP, "state", "alerts.jsonl")  # INTENT_GUARD_ALERTS in clean_env
 REPORTER = os.path.join(LAB, ".claude", "agents", "intent-guard-reporter.md")
 
 
@@ -840,8 +844,10 @@ class Alerts(unittest.TestCase):
         run_hook(tool_call("Read", {"file_path": INBOX}, session=s), STUB_MODE="misaligned",
                  INTENT_GUARD_STRICT="1")  # denied: never read, not recorded
         run_hook(tool_call("Read", {"file_path": log_file}, session=s))  # a repeat is listed once
-        code, out = run_hook(stop_call(self.ANSWER, session=s), STUB_REPORTER="declined")
-        got = alerts()[-1]["sources_read"]
+        # the guard's own alert for the denied call carries the sources read before it
+        blocked = alerts()[-1]
+        self.assertEqual(blocked["kind"], "guard_blocked")
+        got = blocked["sources_read"]
         self.assertEqual([g["tool"] for g in got], ["Read", "Grep", "Glob", "WebFetch", "WebSearch",
                                                     "mcp__web__fetch_page", "mcp__notes__list", "Bash"])
         self.assertEqual([g["source"] for g in got],
@@ -850,14 +856,15 @@ class Alerts(unittest.TestCase):
                           "url=https://example.test/a page_path=/b", "(no url or path argument)",
                           "cat logs/ci-run-4812.txt"])
         self.assertNotIn("inbox", json.dumps(got))
-        # the guard's own alert carries the sources read before the call
-        code, out = run_hook(tool_call("Read", {"file_path": INBOX}, session=s), STUB_MODE="misaligned")
+        code, out = run_hook(stop_call(self.ANSWER, session=s), STUB_REPORTER="declined")
         self.assertEqual(alerts()[-1]["sources_read"], got)
-        # a new prompt starts a new, empty list
-        run_hook(prompt("Thanks", session=s, pid="p-2"))
+        # the Stop hook deletes the list once it has read it
         self.assertFalse(os.path.exists(src_file))
         code, out = run_hook(stop_call(self.ANSWER, session=s), STUB_REPORTER="declined")
         self.assertEqual(alerts()[-1]["sources_read"], [])
+        # a new prompt starts a new, empty list
+        run_hook(prompt("Thanks", session=s, pid="p-2"))
+        self.assertFalse(os.path.exists(src_file))
         # long sources are cut, many sources are capped
         os.environ["INTENT_GUARD_HOME"] = j(TMP, "state")
         try:
@@ -872,6 +879,286 @@ class Alerts(unittest.TestCase):
         self.assertEqual(many[-1], {"tool": "", "source": "(11 more not shown)"})
         self.assertIsNone(ig.source_of("Write", {"file_path": "x"}))
         self.assertIsNone(ig.source_of("LSP", {"filePath": "x"}))
+
+
+DAY = 86400
+
+
+def store_of(home, project):
+    """The default prompt store the guard should pick for a project."""
+    p = ig.norm(project, project)
+    return os.path.join(home, ".claude", "intent-guard",
+                        os.path.basename(p) + "-" + hashlib.sha256(p.encode("utf-8")).hexdigest()[:10])
+
+
+def make(path, when):
+    """A small file whose modified time is when (seconds since the epoch)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{}\n")
+    os.utime(path, (when, when))
+    return path
+
+
+class Store(unittest.TestCase):
+    """The saved prompts sit in a per-project folder under the home folder (a fake
+    one here), files older than RETENTION_DAYS are swept on each prompt, and the
+    Stop hook deletes the sources list. The log and the alerts stay in the project."""
+
+    def setUp(self):
+        self.saved = dict(os.environ)
+        self.root = tempfile.mkdtemp(prefix="store-", dir=OUTSIDE)
+        self.home = os.path.join(self.root, "home")
+        os.makedirs(self.home)
+        os.makedirs(TMP, exist_ok=True)
+        for k in ("INTENT_GUARD_HOME", "INTENT_GUARD_LOG", "INTENT_GUARD_ALERTS"):
+            os.environ.pop(k, None)
+        os.environ.update(USERPROFILE=self.home, HOME=self.home)  # Windows reads USERPROFILE, POSIX HOME
+        if os.path.exists(CAPTURE):
+            os.remove(CAPTURE)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved)
+
+    def env(self, proj):
+        """Hook environment with the fake home and no INTENT_GUARD_HOME, _LOG or _ALERTS."""
+        return dict(CLAUDE_PROJECT_DIR=proj, USERPROFILE=self.home, HOME=self.home,
+                    INTENT_GUARD_HOME=None, INTENT_GUARD_LOG=None, INTENT_GUARD_ALERTS=None)
+
+    def project(self):
+        return tempfile.mkdtemp(prefix="proj-", dir=self.root)
+
+    def test_1_default_store_is_in_the_home_folder(self):
+        root = os.path.join(self.home, ".claude", "intent-guard")
+        store = ig.data_dir(LAB)
+        self.assertEqual(ig.store_root(), root)
+        self.assertEqual(os.path.dirname(store), root)
+        self.assertRegex(os.path.basename(store),  # the project folder name, then the hash
+                         "^%s-[0-9a-f]{10}$" % re.escape(os.path.basename(LAB)))
+        self.assertEqual(store, store_of(self.home, LAB))
+        self.assertEqual(ig.session_file({"session_id": "s/1"}, LAB), os.path.join(store, "sessions", "s_1.jsonl"))
+        self.assertEqual(ig.sources_file({"session_id": "s/1"}, LAB),
+                         os.path.join(store, "sessions", "s_1-sources.jsonl"))
+        # one folder per project, however its path is spelled
+        spellings = [LAB + os.sep, os.path.join(LAB, "web", "..")]
+        if WINDOWS:
+            spellings += [LAB.upper(), LAB.lower(), LAB.replace("\\", "/"), LAB + "."]
+        for spelling in spellings:
+            self.assertEqual(ig.data_dir(spelling), store, spelling)
+        # another project with the same folder name gets another folder
+        other = ig.data_dir(os.path.join(self.root, os.path.basename(LAB)))
+        self.assertNotEqual(other, store)
+        self.assertRegex(os.path.basename(other), "^%s-[0-9a-f]{10}$" % re.escape(os.path.basename(LAB)))
+        self.assertRegex(os.path.basename(ig.data_dir(os.path.join(self.root, "my site (old)"))),
+                         r"^my_site__old_-[0-9a-f]{10}$")
+        self.assertFalse(os.path.exists(root))  # working out the name creates nothing
+        # the log and the alerts stay in the project
+        self.assertEqual(ig.log_path(LAB), os.path.join(LAB, ".claude", "intent-guard.log"))
+        self.assertEqual(ig.alerts_path(LAB), os.path.join(LAB, ".claude", "intent-guard", "alerts.jsonl"))
+        # INTENT_GUARD_HOME still moves the store, and only the store
+        custom = os.path.join(self.root, "custom")
+        os.environ["INTENT_GUARD_HOME"] = custom
+        self.assertEqual(ig.data_dir(LAB), custom)
+        self.assertEqual(ig.session_file({"session_id": "s1"}, LAB), os.path.join(custom, "sessions", "s1.jsonl"))
+        self.assertEqual(ig.alerts_path(LAB), os.path.join(LAB, ".claude", "intent-guard", "alerts.jsonl"))
+        os.environ["INTENT_GUARD_ALERTS"] = os.path.join(self.root, "siem.jsonl")
+        self.assertEqual(ig.alerts_path(LAB), os.path.join(self.root, "siem.jsonl"))
+
+    def test_2_hooks_use_the_home_store(self):
+        proj, s = self.project(), "st-2"
+        store, env = store_of(self.home, proj), self.env(proj)
+        code, out = run_hook(prompt("What is the TSLA price?", session=s, cwd=proj), **env)
+        self.assertIn("Intent guard is on", out["systemMessage"])
+        with open(os.path.join(store, "sessions", s + ".jsonl"), encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["text"], "What is the TSLA price?")
+        self.assertFalse(os.path.exists(os.path.join(proj, ".claude", "intent-guard", "sessions")))
+        self.assertFalse(os.path.exists(os.path.join(REAL_HOME, ".claude", "intent-guard", os.path.basename(store))))
+        # the judge sees the saved prompt
+        code, out = run_hook(tool_call("Read", {"file_path": INBOX}, session=s, cwd=proj),
+                             STUB_MODE="misaligned", **env)
+        self.assertEqual(decision(out), "ask")
+        self.assertIn("What is the TSLA price?", capture()["stdin"])
+        self.assertTrue(os.path.exists(os.path.join(store, "sessions", s + "-sources.jsonl")))
+        # the log and the alerts are where they were, in the project
+        project_alerts = os.path.join(proj, ".claude", "intent-guard", "alerts.jsonl")
+        self.assertEqual(alerts(project_alerts)[-1]["kind"], "guard_asked")
+        with open(os.path.join(proj, ".claude", "intent-guard.log"), encoding="utf-8") as f:
+            self.assertEqual([json.loads(l)["event"] for l in f], ["prompt", "tool"])
+        # a tool call that writes to the store is blocked like the guard's other files
+        code, out = run_hook(tool_call("Write", {"file_path": os.path.join(store, "sessions", s + ".jsonl"),
+                                                 "content": "{}"}, session=s, cwd=proj), **env)
+        self.assertEqual(decision(out), "deny")
+        self.assertEqual(alerts(project_alerts)[-1]["kind"], "guard_blocked")
+
+    def test_3_store_root_is_protected(self):
+        j = os.path.join
+        root, store = j(self.home, ".claude", "intent-guard"), ig.data_dir(LAB)
+        for target in (j(store, "sessions", "s.jsonl"), j(store, "sessions", "s-sources.jsonl"),
+                       j(root, "other-0123456789", "sessions", "s.jsonl"), j(root, "new.txt"), root):
+            for tool, key in (("Write", "file_path"), ("Edit", "file_path"), ("MultiEdit", "file_path"),
+                              ("NotebookEdit", "notebook_path")):
+                self.assertEqual(ig.route(tool, {key: target, "content": "x"}, LAB), "protect", (tool, target))
+        if WINDOWS:
+            for target in (j(self.home, ".CLAUDE", "Intent-Guard", "x.jsonl"), j(store, "sessions", "s.jsonl."),
+                           j(store, "sessions", "s.jsonl::$DATA"), j(root + ".", "x.jsonl")):
+                self.assertEqual(ig.route("Write", {"file_path": target, "content": "x"}, LAB), "protect", target)
+        # neighbours of the store are not guard files, and a read of the store is judged
+        for target in (j(self.home, ".claude", "intent-guard-notes", "x.txt"), j(self.home, ".claude", "x.json")):
+            self.assertEqual(ig.route("Write", {"file_path": target, "content": "x"}, LAB), "judge", target)
+        self.assertEqual(ig.route("Read", {"file_path": j(store, "sessions", "s.jsonl")}, LAB), "judge")
+        # the project's own intent-guard folder, which holds the alerts, stays protected
+        for rel in ("alerts.jsonl", "alerts.jsonl.lock", j("sessions", "old.jsonl")):
+            self.assertEqual(ig.route("Write", {"file_path": j(LAB, ".claude", "intent-guard", rel),
+                                                "content": "x"}, LAB), "protect", rel)
+        # with INTENT_GUARD_HOME, that folder and the store root are both protected
+        os.environ["INTENT_GUARD_HOME"] = custom = j(self.root, "custom")
+        for target in (j(custom, "sessions", "s.jsonl"), j(root, "x.jsonl")):
+            self.assertEqual(ig.route("Edit", {"file_path": target}, LAB), "protect", target)
+
+    def test_4_sweep_deletes_only_old_files_in_this_store(self):
+        j, proj = os.path.join, self.project()
+        store = store_of(self.home, proj)
+        sessions = j(store, "sessions")
+        old, recent = time.time() - (ig.RETENTION_DAYS + 1) * DAY, time.time() - (ig.RETENTION_DAYS - 1) * DAY
+        elsewhere = j(self.root, "elsewhere")
+        hard_target = make(j(elsewhere, "hard.jsonl"), old)
+        gone = [make(j(sessions, "old.jsonl"), old), make(j(sessions, "old-sources.jsonl"), old),
+                make(j(sessions, "old.jsonl.lock"), old)]
+        os.link(hard_target, j(sessions, "hard.jsonl"))  # a second name for a file outside
+        gone.append(j(sessions, "hard.jsonl"))
+        kept = [make(j(sessions, "recent.jsonl"), recent),
+                make(j(sessions, "folder", "old.jsonl"), old),  # a folder inside is never entered
+                make(j(store, "old-notes.txt"), old),  # next to the sessions folder
+                make(j(self.home, ".claude", "intent-guard", "other-0123456789", "sessions", "old.jsonl"), old),
+                make(j(proj, ".claude", "intent-guard", "sessions", "old.jsonl"), old),  # the old place in the project
+                make(j(elsewhere, "old.jsonl"), old), hard_target]
+        os.utime(j(sessions, "folder"), (old, old))
+        code, out = run_hook(prompt("Hello", session="st-4", cwd=proj), **self.env(proj))
+        self.assertIn("Intent guard is on", out["systemMessage"])
+        for p in gone:
+            self.assertFalse(os.path.exists(p), p)
+        for p in kept:
+            self.assertTrue(os.path.exists(p), p)
+        self.assertTrue(os.path.exists(j(sessions, "st-4.jsonl")))
+        with open(j(proj, ".claude", "intent-guard.log"), encoding="utf-8") as f:
+            self.assertEqual([json.loads(l)["event"] for l in f], ["prompt"])  # no sweep error
+
+    def test_5_sweep_never_follows_a_linked_sessions_folder(self):
+        j, proj = os.path.join, self.project()
+        store = store_of(self.home, proj)
+        target = j(self.root, "linked")
+        old_file = make(j(target, "old.jsonl"), time.time() - (ig.RETENTION_DAYS + 5) * DAY)
+        os.makedirs(store)
+        link = j(store, "sessions")
+        try:
+            if WINDOWS:
+                import _winapi
+                _winapi.CreateJunction(target, link)  # needs no special rights, unlike a symlink
+            else:
+                os.symlink(target, link)
+        except (OSError, ImportError, AttributeError) as e:
+            self.skipTest("can't make a link here: %s" % e)
+        try:
+            code, out = run_hook(prompt("Hello", session="st-5", cwd=proj), **self.env(proj))
+            self.assertIn("Intent guard is on", out["systemMessage"])  # the prompt is still saved
+            self.assertTrue(os.path.exists(old_file))
+            with open(j(proj, ".claude", "intent-guard.log"), encoding="utf-8") as f:
+                sweep = [json.loads(l) for l in f if '"sweep"' in l]
+            self.assertEqual(len(sweep), 1, sweep)
+            self.assertEqual(sweep[0]["decision"], "error")
+            self.assertIn("is a link, so it is not swept", sweep[0]["reason"])
+        finally:
+            os.rmdir(link) if WINDOWS else os.unlink(link)  # removes the link only
+
+    def test_6_sweep_never_follows_a_link_inside_the_folder(self):
+        j = os.path.join
+        os.environ["INTENT_GUARD_HOME"] = state = j(self.root, "state6")
+        os.environ["INTENT_GUARD_LOG"] = j(self.root, "t6.log")
+        old = time.time() - (ig.RETENTION_DAYS + 5) * DAY
+        target_dir, target_file = j(self.root, "outside-dir"), make(j(self.root, "outside.jsonl"), old)
+        in_dir = make(j(target_dir, "old.jsonl"), old)
+        sessions = j(state, "sessions")
+        os.makedirs(sessions)
+        links = [j(sessions, "linked-dir")]
+        try:
+            if WINDOWS:
+                import _winapi
+                _winapi.CreateJunction(target_dir, links[0])
+            else:
+                os.symlink(target_dir, links[0])
+        except (OSError, ImportError, AttributeError) as e:
+            self.skipTest("can't make a link here: %s" % e)
+        try:
+            os.symlink(target_file, j(sessions, "link.jsonl"))  # Windows needs developer mode for this
+            links.append(j(sessions, "link.jsonl"))
+            if os.utime in os.supports_follow_symlinks:
+                os.utime(links[1], (old, old), follow_symlinks=False)  # the link itself looks old too
+        except OSError:
+            pass
+        try:
+            ig.sweep_sessions({"session_id": "st-6"}, LAB)
+            for link in links:
+                self.assertTrue(os.path.lexists(link), link)
+            self.assertTrue(os.path.exists(in_dir))
+            self.assertTrue(os.path.exists(target_file))
+        finally:
+            os.rmdir(links[0]) if WINDOWS else os.unlink(links[0])  # removes the link only
+
+    def test_7_sweep_problems_never_stop_the_prompt(self):
+        j = os.path.join
+        os.environ["INTENT_GUARD_HOME"] = state = j(self.root, "state7")
+        os.environ["INTENT_GUARD_LOG"] = log = j(self.root, "t7.log")
+        os.makedirs(j(state, "sessions"))
+        real = os.scandir
+
+        def broken(*a, **k):
+            raise PermissionError("access denied in the test")
+        os.scandir = broken
+        try:
+            out = ig.on_prompt({"session_id": "st-7", "prompt": "Hello", "prompt_id": "p-1"}, LAB)
+        finally:
+            os.scandir = real
+        self.assertIn("Intent guard is on", out["systemMessage"])
+        self.assertTrue(os.path.exists(j(state, "sessions", "st-7.jsonl")))
+        with open(log, encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f]
+        self.assertEqual([(r["event"], r["decision"]) for r in rows if r["event"] == "sweep"], [("sweep", "error")])
+        self.assertIn("access denied in the test", rows[0]["reason"])
+        self.assertEqual(rows[-1]["event"], "prompt")
+        if WINDOWS:  # a file another program holds open can't be deleted; the rest still goes
+            old = time.time() - (ig.RETENTION_DAYS + 1) * DAY
+            busy, free = make(j(state, "sessions", "busy.jsonl"), old), make(j(state, "sessions", "free.jsonl"), old)
+            with open(busy, encoding="utf-8"):
+                ig.sweep_sessions({"session_id": "st-7"}, LAB)
+            self.assertTrue(os.path.exists(busy))
+            self.assertFalse(os.path.exists(free))
+            with open(log, encoding="utf-8") as f:
+                last = json.loads(f.readlines()[-1])
+            self.assertEqual((last["event"], last["decision"]), ("sweep", "error"))
+            self.assertIn("busy.jsonl", last["reason"])
+
+    def test_8_stop_deletes_the_sources_list(self):
+        j, proj, s = os.path.join, self.project(), "st-8"
+        src, env = j(store_of(self.home, proj), "sessions", s + "-sources.jsonl"), self.env(proj)
+        run_hook(prompt("Why does npm test fail?", session=s, cwd=proj), **env)
+        run_hook(tool_call("Read", {"file_path": j(proj, "notes.txt")}, session=s, cwd=proj), **env)
+        self.assertTrue(os.path.exists(src))
+        # stop_hook_active: the turn goes on, so the list stays
+        run_hook(stop_call(Alerts.ANSWER, session=s, active=True, cwd=proj), STUB_REPORTER="declined", **env)
+        self.assertTrue(os.path.exists(src))
+        code, out = run_hook(stop_call(Alerts.ANSWER, session=s, cwd=proj), STUB_REPORTER="declined", **env)
+        self.assertIsNone(out)
+        self.assertFalse(os.path.exists(src))
+        a = alerts(j(proj, ".claude", "intent-guard", "alerts.jsonl"))[-1]
+        self.assertEqual(a["sources_read"], [{"tool": "Read", "source": j(proj, "notes.txt")}])
+        # also when the reporter fails
+        run_hook(tool_call("Read", {"file_path": j(proj, "notes.txt")}, session=s, cwd=proj), **env)
+        self.assertTrue(os.path.exists(src))
+        run_hook(stop_call(Alerts.ANSWER, session=s, cwd=proj), STUB_REPORTER="garbage", **env)
+        self.assertFalse(os.path.exists(src))
+        with open(j(proj, ".claude", "intent-guard.log"), encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readlines()[-1])["decision"], "error")
 
 
 class Settings(unittest.TestCase):

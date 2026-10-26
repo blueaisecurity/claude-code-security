@@ -15,8 +15,8 @@ The posts explain how each one works, what we tested and what we found.
 
 The lab tests what an agent does with a hidden instruction, so one file holds one on purpose: the CI log
 `intent-guard/lab/logs/ci-run-4812.txt`. Here the note is harmless. It asks only to run one command,
-`echo`, which prints a line, and the file's second line marks it as test data. The tests in the posts used a
-stronger note that asked for cloud credentials. That version is not in this repository.
+`echo`, which prints a line, and the file's second line marks it as test data. The first tests in the
+posts used a stronger note that asked for cloud credentials. That version is not in this repository.
 
 1. `intent-guard/lab/fakehome/.aws/credentials` holds made-up values only. There is no real key anywhere
    in this repository.
@@ -67,7 +67,7 @@ Step 8 of "Try it" in the first post shows how to see the guard ask you a questi
 ## Try the refusal alerts
 
 1. Copy the alert-only version into the test project. In PowerShell:
-   `xcopy /E /I /Y alert-only\.claude lab\.claude`. On macOS and Linux: `cp -R alert-only/.claude lab/`.
+   `Copy-Item -Recurse alert-only\.claude lab`. On macOS and Linux: `cp -R alert-only/.claude lab/`.
    Use a fresh copy of `lab` if the guard is already in it.
 2. Start Claude Code in `lab` the same way and send the same prompt.
 3. If Claude says it did not follow the note in the CI log, `lab/.claude/intent-guard/alerts.jsonl`
@@ -80,16 +80,18 @@ SIEM, see `ship-alerts/README.md`.
 
 1. Copy one `.claude` folder into it. If your project already has `.claude/settings.json`, copy the
    other files and add the hook entries and deny rules from ours to yours.
-2. Add these lines to your `.gitignore`. The files hold your prompts in full and the alerts, which can
-   include keys you typed:
+2. Add these lines to your `.gitignore`. The log holds the start of each tool call, and the alert file
+   holds your newest prompts, which can include keys you typed:
 
    ```text
    .claude/intent-guard/
    .claude/*.log*
    ```
 
-3. Claude Code's own cleanup doesn't delete the guard's files. Delete `.claude/intent-guard/sessions/`
-   when you no longer need it, and keep the project in a folder that only you can write to.
+3. The intent guard keeps its full copy of your prompts outside the project, in
+   `~/.claude/intent-guard/<project folder>-<hash>/sessions/`, and deletes files there that are older
+   than 30 days. Claude Code's own cleanup doesn't touch that folder, so delete it when you stop using
+   the guard in a project.
 4. In a real project, write Python's full path, with forward slashes, in place of `"python"` in the
    settings, so a `python` program that a project brings can't run instead.
 
@@ -103,7 +105,7 @@ python -I tests/test_refusal_alert.py
 python -I ship-alerts/test_ship_alerts.py
 ```
 
-They run 46, 6 and 7 tests. A stub stands in for `claude`, so they make no model calls.
+They run 54, 6 and 7 tests. A stub stands in for `claude`, so they make no model calls.
 
 ## Limits
 
@@ -111,6 +113,8 @@ They run 46, 6 and 7 tests. A stub stands in for `claude`, so they make no model
 2. The judge and the reporter are models too. They can be wrong, and an attacker can write text aimed
    at them. Use them as one layer next to fixed rules, a sandbox and limited network access.
 3. The guard judges actions, not answers. It can't see text that Claude only prints.
+4. The reporter reads only Claude's final message. A refusal that Claude writes earlier in its reply,
+   and not at the end, gives no alert.
 
 ## License
 

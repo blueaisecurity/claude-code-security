@@ -13,18 +13,23 @@ Python 3 standard library only. It prints nothing or one JSON object and
 always exits 0. It never answers "allow", so it can only add checks. On Stop
 it prints nothing at all, so it never keeps the model working.
 
-Files it writes: .claude/intent-guard.log (one line per tool call, without
-file contents), .claude/intent-guard/sessions/ (every prompt in full, and per
-session a -sources.jsonl list of what the model read in the current turn) and
-.claude/intent-guard/alerts.jsonl (one JSON line per alert, for a SIEM: the
-guard's own asks and blocks, and the model's own refusals, each with the exact
-sources read that turn).
+Files it writes: in the project, .claude/intent-guard.log (one line per tool
+call, without file contents) and .claude/intent-guard/alerts.jsonl (one JSON
+line per alert, for a SIEM: the guard's own asks and blocks, and the model's
+own refusals, each with the exact sources read that turn). Outside the project,
+in your home folder, .claude/intent-guard/<project folder>-<hash>/sessions/:
+every prompt in full, deleted after RETENTION_DAYS days, and per session a
+-sources.jsonl list of what the model read in the current turn, deleted once
+the Stop hook has read it. INTENT_GUARD_HOME, INTENT_GUARD_LOG and
+INTENT_GUARD_ALERTS move these files.
 """
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -43,6 +48,7 @@ MAX_PROMPTS = 20             # the newest prompts the judge sees
 MAX_ANSWER = 8000            # the reporter sees at most this much of the final answer
 ALERT_CUT = 300              # characters per text field in alerts.jsonl
 MAX_SOURCES = 50             # content sources listed in one alert
+RETENTION_DAYS = 30          # days; saved prompt files older than this are deleted
 JUDGE_SETTING_SOURCES = "project"  # settings files the judge loads
 SKIP_TOOLS = {
     "TodoWrite", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop",
@@ -146,8 +152,22 @@ def project_of(data):
     return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
+def store_root():
+    """The folder in your home folder that holds the saved prompts of every project."""
+    return os.path.join(os.path.expanduser("~"), ".claude", "intent-guard")
+
+
 def data_dir(project):
-    return os.environ.get("INTENT_GUARD_HOME") or os.path.join(project, ".claude", "intent-guard")
+    """This project's saved prompts. They are kept in your home folder, not in the
+    project, so they are not committed or synced with the project. The folder name
+    is the project folder's name plus the start of a hash of its full path, so two
+    projects with the same name get different folders."""
+    if os.environ.get("INTENT_GUARD_HOME"):
+        return os.environ["INTENT_GUARD_HOME"]
+    p = norm(project, project)
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", os.path.basename(p.rstrip("\\/")))[:40] or "project"
+    digest = hashlib.sha256(p.encode("utf-8", "replace")).hexdigest()[:10]
+    return os.path.join(store_root(), name + "-" + digest)
 
 
 def log_path(project):
@@ -155,7 +175,7 @@ def log_path(project):
 
 
 def alerts_path(project):
-    return os.environ.get("INTENT_GUARD_ALERTS") or os.path.join(data_dir(project), "alerts.jsonl")
+    return os.environ.get("INTENT_GUARD_ALERTS") or os.path.join(project, ".claude", "intent-guard", "alerts.jsonl")
 
 
 def is_network(p):
@@ -225,11 +245,12 @@ def guard_files(project):
 
 
 def is_guard_file(target, project, cwd):
-    """The guard's own files, and every settings and agent file in .claude.
-    A planted agent file or settings file could replace the judge or turn the
-    hooks off."""
+    """The guard's own files and folders, the saved prompts of every project, and
+    every settings and agent file in .claude. A planted agent file or settings
+    file could replace the judge or turn the hooks off."""
     t = norm(target, cwd)
-    if t in guard_files(project) or below(t, data_dir(project), cwd) is not None:
+    if t in guard_files(project) or any(below(t, d, cwd) is not None for d in (
+            data_dir(project), store_root(), os.path.join(project, ".claude", "intent-guard"))):
         return True
     parts = below(t, os.path.join(project, ".claude"), cwd)
     return bool(parts) and (parts[0] == "agents" or parts[0].startswith("settings"))
@@ -348,8 +369,44 @@ def prompts_from_transcript(path):
 
 def session_file(data, project):
     # The sessions folder holds every prompt in full, including any password or
-    # key you typed or pasted. Delete it when you no longer need it.
+    # key you typed or pasted. Its files are deleted after RETENTION_DAYS days.
     return os.path.join(data_dir(project), "sessions", safe_id(data.get("session_id")) + ".jsonl")
+
+
+def is_link(info):
+    """True for a link, and on Windows also for a junction or another reparse point."""
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0)
+                                              & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def sweep_sessions(data, project):
+    """Deletes the files in this project's sessions folder that were last changed
+    more than RETENTION_DAYS days ago. Only plain files directly in that folder:
+    never a link, a folder or anything outside it. A problem goes to the log and
+    never stops the prompt."""
+    problems = []
+    try:
+        folder = os.path.join(data_dir(project), "sessions")
+        if is_link(os.lstat(folder)):
+            raise OSError("the sessions folder is a link, so it is not swept")
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(info.st_mode) and not is_link(info) and info.st_mtime < cutoff:
+                        os.remove(entry.path)
+                except FileNotFoundError:
+                    continue  # another session's sweep was first
+                except OSError as e:
+                    problems.append("%s: %s" % (entry.name, e))
+    except FileNotFoundError:
+        return  # nothing saved yet
+    except Exception as e:
+        problems.append(str(e))
+    if problems:
+        write_log(project, {"event": "sweep", "session": data.get("session_id"), "decision": "error",
+                            "reason": clean("old prompts not deleted: " + "; ".join(problems))})
 
 
 def load_prompts(data, project):
@@ -783,6 +840,7 @@ def write_alert(data, project, kind, fields, prompts):
 
 
 def on_prompt(data, project):
+    sweep_sessions(data, project)  # never raises
     text = str(data.get("prompt") or "")
     kind = classify(text)
     path = session_file(data, project)
@@ -870,6 +928,7 @@ def on_stop(data, project):
         return None
     prompts, entry["prompts_from"] = load_prompts(data, project)
     sources = load_sources(data, project)  # before the reporter's seconds, not after
+    clear_sources(data, project)  # the list of what the model read does not stay on disk
     text, _ = build_report_input(prompts, message)
     start = time.monotonic()
     try:
