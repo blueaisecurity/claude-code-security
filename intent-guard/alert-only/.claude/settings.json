@@ -27,6 +27,30 @@
           }
         ]
       }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["-I", "${CLAUDE_PROJECT_DIR}/.claude/hooks/refusal_alert.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["-I", "${CLAUDE_PROJECT_DIR}/.claude/hooks/refusal_alert.py"],
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

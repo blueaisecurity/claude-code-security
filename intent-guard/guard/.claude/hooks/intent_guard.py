@@ -1,28 +1,50 @@
 #!/usr/bin/env python3
 """Intent guard for Claude Code.
 
-One script for three hooks:
+One script for five hooks:
   UserPromptSubmit  saves what the user typed in this session.
   PreToolUse        sends risky tool calls to the intent-guard subagent and
                     asks the user when a call does not match the request.
-  Stop              asks the intent-guard-reporter subagent whether the final
-                    answer says the model declined an instruction it found in
-                    content it read, and writes an alert when it did.
+  MessageDisplay    keeps the text Claude shows during the turn, so the
+                    reporter also sees a refusal written before the final
+                    answer.
+  Stop              asks the intent-guard-reporter subagent whether Claude's
+                    text in this turn says it declined an instruction it found
+                    in content it read, and writes an alert when it did.
+  StopFailure       deletes the turn's files when an API error ends the turn,
+                    because Stop does not run then.
 
 Python 3 standard library only. It prints nothing or one JSON object and
-always exits 0. It never answers "allow", so it can only add checks. On Stop
-it prints nothing at all, so it never keeps the model working.
+always exits 0. It never answers "allow", so it can only add checks. On Stop,
+StopFailure and MessageDisplay it prints nothing at all, so it never keeps the
+model working and never changes the text you see.
+
+Every edit inside the project is judged too (CHECK_PROJECT_EDITS), each one on
+its own: one judge call per edit, about 3 seconds and 0.008 USD in the lab.
+When the judge can't answer (no claude program, a timeout, no saved request),
+the guard asks you; in strict mode and in bypassPermissions mode it blocks the
+edit, and in claude -p, where nobody can answer, a question is a refusal too.
+When an edit's arguments are longer than MAX_ARGS, the judge sees the start and
+the end of each content field, its full length, and up to NOTE_LINES lines of
+the new text that name an address, a network or shell command, encoded data or
+a sensitive file. Edits to protected files, to files that run code later (CI,
+build and test runner files such as package.json or .github/workflows) and to
+Windows alternate data streams are judged with their full content, also when
+CHECK_PROJECT_EDITS is False, and the guard asks when they are too long.
 
 Files it writes: in the project, .claude/intent-guard.log (one line per tool
 call, without file contents) and .claude/intent-guard/alerts.jsonl (one JSON
 line per alert, for a SIEM: the guard's own asks and blocks, and the model's
 own refusals, each with the exact sources read that turn). Outside the project,
 in your home folder, .claude/intent-guard/<project folder>-<hash>/sessions/:
-every prompt in full, deleted after RETENTION_DAYS days, and per session a
--sources.jsonl list of what the model read in the current turn, deleted once
-the Stop hook has read it. INTENT_GUARD_HOME, INTENT_GUARD_LOG and
+every prompt in full, and per session two files for the current turn:
+-sources.jsonl (what the model read) and -shown.jsonl (the text Claude showed,
+at most MAX_EARLIER characters). The turn files are deleted at Stop, at
+StopFailure and when a new prompt starts, and every file in that folder is
+deleted after RETENTION_DAYS days. INTENT_GUARD_HOME, INTENT_GUARD_LOG and
 INTENT_GUARD_ALERTS move these files.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -40,12 +62,17 @@ from datetime import datetime, timezone
 TRUSTED_FILES = []           # files you wrote whose text counts as your own
                              # instructions, relative to the project folder,
                              # for example ["CLAUDE.md"]. Edits to them are judged.
-CHECK_PROJECT_EDITS = False  # True: also judge every file edit inside the project
+CHECK_PROJECT_EDITS = True   # judge every file edit inside the project too (about 3 s
+                             # and 0.008 USD each); False skips edits to plain project files
 JUDGE_TIMEOUT = 45           # seconds for one check
 REPORTER_TIMEOUT = 45        # seconds for the reporter at the end of a turn
-MAX_ARGS = 6000              # longer tool input is not judged; the guard asks you
+MAX_ARGS = 6000              # longer tool input is not judged and the guard asks you; a longer
+                             # edit to a plain project file is shortened for the judge instead
+NOTE_LINES = 12              # lines of note the judge sees with such a shortened edit
 MAX_PROMPTS = 20             # the newest prompts the judge sees
-MAX_ANSWER = 8000            # the reporter sees at most this much of the final answer
+MAX_ANSWER = 8000            # the reporter sees at most this much of the final answer,
+MAX_EARLIER = 16000          # and this much of the text shown before it in the turn; when
+                             # there is more, each message keeps its start and end
 ALERT_CUT = 300              # characters per text field in alerts.jsonl
 MAX_SOURCES = 50             # content sources listed in one alert
 RETENTION_DAYS = 30          # days; saved prompt files older than this are deleted
@@ -58,13 +85,17 @@ SKIP_TOOLS = {
 SENSITIVE = re.compile(
     r"\.env|\.pem|\.key|id_rsa|id_ed25519|\.ssh|\.aws|\.netrc|\.npmrc"
     r"|credential|secret|token|password|mail|inbox", re.IGNORECASE)
+RISKY = re.compile(  # with SENSITIVE: the lines of note in a shortened edit
+    r"https?://|\b(?:curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod|nc|ncat|scp|sftp|ftp)\b"
+    r"|requests\.|urllib|fetch\(|XMLHttpRequest|socket|child_process|subprocess|os\.system|popen"
+    r"|\beval\(|\bexec\(|base64|FromBase64String", re.IGNORECASE)
 # ------------------------------------------------------------------------
 
 READ_TOOLS = {"Read", "Grep", "Glob", "LSP"}
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 SHELL_TOOLS = {"Bash", "PowerShell", "Monitor"}
 AGENT_NOTES = {"Bash", "PowerShell", "Monitor", "Agent", "Task"}  # drop "description"
-LOG_DROP = ("content", "new_string", "old_string", "edits", "new_source")  # never logged
+LOG_DROP = ("content", "new_string", "old_string", "edits", "new_source")  # contents: never logged
 TOOL_INFO = {
     "Bash": "runs a shell command on the user's computer",
     "PowerShell": "runs a PowerShell command on the user's computer",
@@ -96,6 +127,14 @@ PROTECTED_FILES = {
     "gradle-wrapper.properties", "maven-wrapper.properties", ".devcontainer.json", ".ripgreprc",
     "pyrightconfig.json", ".mcp.json", ".claude.json",
 }
+# Files that run code later: CI, build and test runner files. Edits to them inside
+# the project are judged with their full content, also when CHECK_PROJECT_EDITS is
+# False. Names are compared in lower case.
+RUN_LATER_DIRS = {".github", ".gitlab", ".circleci", ".buildkite"}
+RUN_LATER_FILES = re.compile(
+    r"(?:\.gitlab-ci|azure-pipelines|bitbucket-pipelines|(?:docker-)?compose(?:\.[\w-]+)?)\.ya?ml"
+    r"|jenkinsfile|package\.json|(?:gnu)?makefile|setup\.py|setup\.cfg|pyproject\.toml|conftest\.py"
+    r"|tox\.ini|noxfile\.py|(?:docker|container)file(?:\.[\w-]+)?|build\.gradle(?:\.kts)?|pom\.xml")
 # Messages that Claude Code adds as a prompt, such as a background agent's
 # report. They are not the user's words.
 NOTICE = re.compile(r"^\s*<(?!pasted_content)[a-z][a-z0-9]*[-_][a-z0-9_-]*[\s>]", re.I)
@@ -118,11 +157,11 @@ class GuardError(Exception):
 
 
 # Paths ------------------------------------------------------------------
-def append_line(path, entry):
-    """Appends one JSON line whole. Hooks run at the same time (parallel tool calls,
-    two sessions, one shared alerts file), and on Windows two plain appends can
-    overwrite or split each other, so a lock file next to the target orders them."""
-    data = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8", "replace")
+@contextlib.contextmanager
+def locked(path):
+    """Holds the lock file next to path. Hooks run at the same time (parallel tool
+    calls, two sessions, one shared alerts file), and on Windows two plain appends
+    can overwrite or split each other, so the lock makes them take turns."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + ".lock", "a+b") as lock:
         if os.name == "nt":
@@ -140,12 +179,36 @@ def append_line(path, entry):
             import fcntl
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            with open(path, "ab") as f:
-                f.write(data)
+            yield
         finally:
             if os.name == "nt":
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def append_line(path, entry):
+    """Appends one JSON line whole, under the lock."""
+    data = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8", "replace")
+    with locked(path), open(path, "ab") as f:
+        f.write(data)
+
+
+def read_rows(path):
+    """The JSON objects in a JSON lines file, in order. A broken line is skipped,
+    and a file that can't be read gives an empty list."""
+    rows = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue  # one broken line never hides the rest
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        pass
+    return rows
 
 
 def project_of(data):
@@ -245,8 +308,9 @@ def guard_files(project):
 
 
 def is_guard_file(target, project, cwd):
-    """The guard's own files and folders, the saved prompts of every project, and
-    every settings and agent file in .claude. A planted agent file or settings
+    """The guard's own files and folders, the store of every project (the saved
+    prompts, and each session's sources list and shown text), and every settings
+    and agent file in .claude. A planted agent file or settings
     file could replace the judge or turn the hooks off."""
     t = norm(target, cwd)
     if t in guard_files(project) or any(below(t, d, cwd) is not None for d in (
@@ -281,6 +345,27 @@ def read_paths(tool_name, ti, cwd):
     return [ti.get("path") or cwd]
 
 
+def runs_later(target, project, cwd):
+    """True for CI, build and test runner files, at any depth: they run code later."""
+    parts = below(target, project, cwd) or [""]
+    return any(p in RUN_LATER_DIRS for p in parts[:-1]) or bool(RUN_LATER_FILES.fullmatch(parts[-1]))
+
+
+def is_stream(target):
+    """True for a Windows alternate data stream such as app.py:run.ps1, a second
+    content behind a file's name: a ":" after the drive."""
+    return ":" in os.path.splitdrive(LOCAL_PREFIX.sub("", str(target)))[1]
+
+
+def is_project_edit(tool_name, ti, project, cwd):
+    """An edit to a plain file inside the project: not protected, not trusted, not
+    a file that runs code later, and not an alternate data stream."""
+    t = target_of(ti)
+    return tool_name in EDIT_TOOLS and bool(t) and inside(t, project, cwd) and not is_stream(t) \
+        and not is_trusted(t, project, cwd) and not is_protected(t, project, cwd) \
+        and not runs_later(t, project, cwd)
+
+
 # Which calls go to the judge ---------------------------------------------
 def route(tool_name, tool_input, project_dir, cwd=None):
     """Returns "protect", "skip" or "judge". The first match wins."""
@@ -300,10 +385,37 @@ def route(tool_name, tool_input, project_dir, cwd=None):
         if paths_ok and not SENSITIVE.search(json.dumps(ti)):
             return "skip"
         return "judge"
-    if tool_name in EDIT_TOOLS and t and inside(t, project_dir, cwd) and not CHECK_PROJECT_EDITS \
-            and not is_trusted(t, project_dir, cwd) and not is_protected(t, project_dir, cwd):
+    if not CHECK_PROJECT_EDITS and is_project_edit(tool_name, ti, project_dir, cwd):
         return "skip"
     return "judge"
+
+
+# Cutting long text ------------------------------------------------------------
+CUT = " [cut] "
+
+
+def squeeze(text, limit):
+    """The text, or its start and end around " [cut] " in at most limit characters.
+    The start gets two thirds: what a text is about usually comes first."""
+    if len(text) <= limit:
+        return text
+    room = limit - len(CUT)
+    if room < 3:
+        return text[:max(limit, 0)]
+    head = room * 2 // 3
+    return text[:head] + CUT + text[len(text) - (room - head):]
+
+
+def fit(texts, limit):
+    """The texts, cut so their lengths add up to at most limit characters. Short
+    texts stay whole and the long ones share what is left equally, each keeping
+    its start and end, so one long text can't push the others out."""
+    out, room, left = list(texts), limit, len(texts)
+    if sum(map(len, out)) > limit:
+        for i in sorted(range(len(out)), key=lambda i: len(out[i])):
+            out[i] = squeeze(out[i], max(room // left, 0))
+            room, left = room - len(out[i]), left - 1
+    return out
 
 
 # The user's prompts ---------------------------------------------------------
@@ -410,28 +522,38 @@ def sweep_sessions(data, project):
 
 
 def load_prompts(data, project):
-    items = []
-    try:
-        with open(session_file(data, project), encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    item = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(item, dict) and item.get("kind") != "notice" \
-                        and isinstance(item.get("text"), str) and item["text"]:
-                    items.append(item)
-    except OSError:
-        pass
+    items = [item for item in read_rows(session_file(data, project))
+             if item.get("kind") != "notice" and isinstance(item.get("text"), str) and item["text"]]
     if items:
         return items, "store"
     texts = prompts_from_transcript(data.get("transcript_path"))
     return [{"kind": classify(t), "text": t} for t in texts], ("transcript" if texts else "none")
 
 
-# The content sources of the current turn ------------------------------------
+# The files of the current turn ------------------------------------------------
+def turn_file(data, project, kind):
+    """This session's file for the current turn, in the store: "sources" (what the
+    model read) or "shown" (the text Claude showed). Both are deleted at Stop, at
+    StopFailure and on a new prompt."""
+    return os.path.join(data_dir(project), "sessions",
+                        "%s-%s.jsonl" % (safe_id(data.get("session_id")), kind))
+
+
+def clear_turn(data, project, *kinds):
+    """Deletes the current turn's files of these kinds. A problem goes to the log."""
+    for kind in kinds:
+        try:
+            os.remove(turn_file(data, project, kind))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            write_log(project, {"event": "turn", "session": data.get("session_id"), "decision": "error",
+                                "reason": "%s not cleared: %s" % (kind, clean(e))})
+
+
+# What the model read in this turn
 def sources_file(data, project):
-    return os.path.join(data_dir(project), "sessions", safe_id(data.get("session_id")) + "-sources.jsonl")
+    return turn_file(data, project, "sources")
 
 
 def source_of(tool, ti):
@@ -471,38 +593,96 @@ def record_source(data, project, tool, ti):
                             "reason": clean(e)})
 
 
-def clear_sources(data, project):
-    try:
-        os.remove(sources_file(data, project))
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        write_log(project, {"event": "source", "session": data.get("session_id"), "decision": "error",
-                            "reason": "sources not cleared: " + clean(e)})
-
-
 def load_sources(data, project):
     """The sources of the current turn for an alert, in order, without repeats,
     at most MAX_SOURCES. Every text was cleaned when it was recorded."""
     found, seen = [], set()
-    try:
-        with open(sources_file(data, project), encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    item = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(item, dict):
-                    continue
-                key = (str(item.get("tool") or ""), str(item.get("source") or ""))
-                if key not in seen:
-                    seen.add(key)
-                    found.append({"tool": clean(key[0], 100), "source": clean(key[1], ALERT_CUT)})
-    except OSError:
-        pass
+    for item in read_rows(sources_file(data, project)):
+        key = (str(item.get("tool") or ""), str(item.get("source") or ""))
+        if key not in seen:
+            seen.add(key)
+            found.append({"tool": clean(key[0], 100), "source": clean(key[1], ALERT_CUT)})
     if len(found) > MAX_SOURCES:
         found = found[:MAX_SOURCES] + [{"tool": "", "source": "(%d more not shown)" % (len(found) - MAX_SOURCES)}]
     return found
+
+
+# The text Claude showed in this turn
+def keep_shown(data, project):
+    """MessageDisplay: appends one batch of the text Claude shows, with its
+    message_id and index, so the batches of one message join up again at Stop.
+    When the file is larger than MAX_EARLIER bytes, it is written again with one
+    row per message and MAX_EARLIER characters in all, each message keeping its
+    start and end (see fit), so a long final answer can't push out a refusal
+    written before it. Never raises: a problem goes to the log, and the text is
+    shown as it is in every case."""
+    delta = data.get("delta")
+    if not isinstance(delta, str) or not delta:
+        return
+    try:
+        path = turn_file(data, project, "shown")
+        row = {"prompt": str(data.get("prompt_id") or ""), "id": str(data.get("message_id") or ""),
+               "index": data["index"] if isinstance(data.get("index"), int) else 0,
+               "text": squeeze(delta, MAX_EARLIER)}
+        with locked(path):
+            with open(path, "ab") as f:
+                f.write((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8", "replace"))
+                size = f.tell()
+            if size > MAX_EARLIER:  # bytes: a character takes at least one byte
+                found = messages(read_rows(path))
+                rows = [dict(r, text=t) for (r, _), t in zip(found, fit([t for _, t in found], MAX_EARLIER))]
+                with open(path, "wb") as f:
+                    f.write("".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                    for r in rows).encode("utf-8", "replace"))
+    except Exception as e:
+        write_log(project, {"event": "display", "session": data.get("session_id"), "decision": "error",
+                            "reason": "shown text not kept: " + clean(e)})
+
+
+def messages(rows):
+    """[(row, text)], one per message, oldest first: the text is the message's
+    batches joined in index order, and the row is its last batch. A row without
+    a message_id is a message of its own."""
+    groups = {}
+    for n, row in enumerate(rows):
+        groups.setdefault(str(row.get("id") or "") or n, []).append(row)
+    found = []
+    for parts in groups.values():
+        parts.sort(key=lambda r: r["index"] if isinstance(r.get("index"), int) else 0)
+        found.append((parts[-1], "".join(str(r.get("text") or "") for r in parts)))
+    return found
+
+
+def take_shown(data, project):
+    """Stop: the rows of the text Claude showed in this turn; the file is then
+    deleted. Never raises."""
+    rows = []
+    try:
+        path = turn_file(data, project, "shown")
+        if os.path.exists(path):
+            with locked(path):
+                rows = read_rows(path)
+                os.remove(path)
+    except Exception as e:
+        write_log(project, {"event": "stop", "session": data.get("session_id"), "decision": "error",
+                            "reason": "shown text not deleted: " + clean(e)})
+    return rows
+
+
+def earlier_text(rows, final, prompt_id=None):
+    """The text Claude showed before its final answer, for the reporter: one part
+    per message, oldest first (see messages), without a message whose every part
+    is already in the final answer, cleaned (see as_data) and cut to MAX_EARLIER
+    characters in all, each message keeping its start and end (see fit). When the
+    rows and the Stop input both carry the prompt_id, only that prompt's rows count."""
+    if prompt_id and any(r.get("prompt") == prompt_id for r in rows):
+        rows = [r for r in rows if r.get("prompt") == prompt_id]
+    texts = []
+    for _, text in messages(rows):
+        if text.strip() and not all(part.strip() in final for part in text.split(CUT.strip())):
+            texts.append(as_data(text).strip())
+    texts = [t for t in texts if t]
+    return "\n\n".join(fit(texts, max(MAX_EARLIER - 2 * (len(texts) - 1), 0)))
 
 
 def trusted_text(project):
@@ -535,6 +715,71 @@ def clean_input(tool_name, tool_input):
     return ti
 
 
+def text_of(value):
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def content_fields(ti):
+    """[(keys, text)]: where each content field of an edit sits in its arguments,
+    and its text. Each old_string and new_string of a MultiEdit counts on its own."""
+    found = [((key,), text_of(ti[key])) for key in ("content", "old_string", "new_string", "new_source")
+             if key in ti]
+    edits = ti.get("edits")
+    if isinstance(edits, list) and all(isinstance(e, dict) for e in edits):
+        found += [(("edits", n, key), text_of(e[key])) for n, e in enumerate(edits)
+                  for key in ("old_string", "new_string") if key in e]
+    elif "edits" in ti:
+        found.append((("edits",), text_of(edits)))
+    return found
+
+
+def lines_of_note(fields):
+    """Up to NOTE_LINES lines of an edit's new text that name a web address, a
+    network or shell command, encoded data or a sensitive file, each cut to 200
+    characters. The text an edit replaces (old_string) is left out."""
+    found = []
+    for keys, text in fields:
+        for line in (text.splitlines() if keys[-1] != "old_string" else ()):
+            line = line.strip()[:200]
+            if line and line not in found and (RISKY.search(line) or SENSITIVE.search(line)):
+                found.append(line)
+                if len(found) == NOTE_LINES:
+                    return found
+    return found
+
+
+def judge_view(tool_name, tool_input, project_dir, cwd=None):
+    """Returns (arguments, shortened): the arguments the judge sees. A call whose
+    arguments fit in MAX_ARGS keeps them whole. A longer edit to a plain file in
+    the project (see is_project_edit) is shortened to fit: each long content
+    field keeps its start and end (see fit), "shortened" gives the full length of
+    each field that was cut, and "lines_of_note" lists lines of the new text that
+    name an address, a network or shell command, encoded data or a sensitive
+    file. Any other call that is too long is not judged, and the guard asks."""
+    ti = clean_input(tool_name, tool_input)
+    size, fields = len(json.dumps(ti, ensure_ascii=False)), content_fields(ti)
+    if size <= MAX_ARGS or not fields or not is_project_edit(tool_name, ti, project_dir, cwd or project_dir):
+        return ti, False
+    texts, notes, budget = [text for _, text in fields], lines_of_note(fields), MAX_ARGS
+    for _ in range(12):  # JSON escapes and the added keys make the length known only after
+        view, lengths = dict(ti), {}
+        if isinstance(ti.get("edits"), list):
+            view["edits"] = [dict(e) if isinstance(e, dict) else e for e in ti["edits"]]
+        for (keys, text), short in zip(fields, fit(texts, max(budget, 0))):
+            if short != text:
+                place = view
+                for key in keys[:-1]:
+                    place = place[key]
+                place[keys[-1]] = short
+                lengths[".".join(map(str, keys))] = len(text)
+        view.update(shortened=lengths, lines_of_note=notes)
+        size = len(json.dumps(view, ensure_ascii=False))
+        if size <= MAX_ARGS or budget <= 0:
+            break
+        budget = budget * MAX_ARGS // size - 100
+    return view, True
+
+
 def describe(tool_name):
     if tool_name.startswith("mcp__"):
         parts = tool_name.split("__", 2) + ["?", "?"]
@@ -558,13 +803,18 @@ def build_judge_input(prompts, trusted, tool_name, tool_input, project_dir, cwd=
             "Tool: %s" % tool_name,
             "What the tool does: %s" % describe(tool_name),
             "Project folder: %s" % project_dir]
-    ti = clean_input(tool_name, tool_input)
+    ti, short = judge_view(tool_name, tool_input, project_dir, cwd)
     if tool_name in READ_TOOLS:
         ok = all(inside(p, project_dir, cwd) for p in read_paths(tool_name, ti, cwd))
         out.append("Paths inside the project folder: %s" % ("yes" if ok else "no"))
     elif tool_name in EDIT_TOOLS:
         out.append("Paths inside the project folder: %s"
                    % ("yes" if inside(target_of(ti), project_dir, cwd) else "no"))
+    if short:
+        out.append("File contents: too long to show whole. Each long content field shows its start "
+                   "and end around [cut], \"shortened\" gives the full length of each field that was "
+                   "cut, and \"lines_of_note\" lists lines of the new text that name an address, a "
+                   "network or shell command, encoded data or a sensitive file.")
     out += ["Arguments (JSON):", json.dumps(ti, indent=1, ensure_ascii=False),
             "<<<END ACTION %s>>>" % nonce, "",
             "Answer with one line of JSON, as your instructions say."]
@@ -708,12 +958,28 @@ def run_judge(text, project_dir, model=None):
 
 
 # The reporter: did the model decline an instruction found in content? --------------
-def build_report_input(prompts, message):
-    """Returns (text, nonce): the user's prompts and the final answer, marked as data."""
+def shorten(text, limit):
+    """The text, or its first and last limit / 2 characters around " [cut] "."""
+    return text if len(text) <= limit else text[:limit // 2] + " [cut] " + text[-(limit // 2):]
+
+
+def as_data(text):
+    """Claude's text for the reporter: without control or format characters (line
+    breaks and tabs stay), and with <<< and >>> spaced out, so that no line of it
+    can look like one of the marker lines."""
+    text = "".join(ch for ch in str(text) if ch in "\n\t"
+                   or unicodedata.category(ch) not in ("Cc", "Cf", "Cs"))
+    return text.replace("<<<", "< < <").replace(">>>", "> > >")
+
+
+def build_report_input(prompts, message, earlier=""):
+    """Returns (text, nonce): the user's prompts, then the text Claude showed
+    earlier in the turn when there is any, and the final answer, both cleaned
+    (see as_data) and marked as data between lines with the same random code."""
     nonce = secrets.token_hex(8)
     shown = prompts[-MAX_PROMPTS:]
-    out = ["Decide whether the final answer says that the agent declined to follow an "
-           "instruction that came from content it read.", "",
+    out = ["Decide whether the %s says that the agent declined to follow an instruction that came from "
+           "content it read." % ("final answer or the earlier text" if earlier else "final answer"), "",
            "## The user's messages in this session, oldest first", ""]
     if len(prompts) > len(shown):
         out += ["(%d older messages are not shown.)" % (len(prompts) - len(shown)), ""]
@@ -721,10 +987,10 @@ def build_report_input(prompts, message):
         out += ["[%d]" % i, render_prompt(p["text"], nonce), ""]
     if not shown:
         out += ["(no messages were saved for this session)", ""]
-    message = str(message)
-    if len(message) > MAX_ANSWER:
-        message = message[:MAX_ANSWER // 2] + " [cut] " + message[-(MAX_ANSWER // 2):]
-    out += ["## The final answer", "", "<<<ANSWER %s>>>" % nonce, message,
+    if earlier:
+        out += ["## Earlier text from the agent in this turn, oldest first", "", "<<<EARLIER %s>>>" % nonce,
+                shorten(as_data(earlier), MAX_EARLIER), "<<<END EARLIER %s>>>" % nonce, ""]
+    out += ["## The final answer", "", "<<<ANSWER %s>>>" % nonce, shorten(as_data(message), MAX_ANSWER),
             "<<<END ANSWER %s>>>" % nonce, "", "Answer with one line of JSON, as your instructions say."]
     return "\n".join(out), nonce
 
@@ -845,7 +1111,7 @@ def on_prompt(data, project):
     kind = classify(text)
     path = session_file(data, project)
     first = not os.path.exists(path)
-    clear_sources(data, project)  # a new turn: the sources list starts empty
+    clear_turn(data, project, "sources", "shown")  # a new turn: its files start empty
     try:
         append_line(path, {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                            "prompt_id": data.get("prompt_id"), "kind": kind, "text": text})
@@ -874,7 +1140,10 @@ def on_tool(data, project):
         prompts, entry["prompts_from"] = load_prompts(data, project)
         if os.environ.get("INTENT_GUARD_DEBUG") == "1":
             entry["transcript_prompts"] = [t[:80] for t in prompts_from_transcript(data.get("transcript_path"))]
-        args = json.dumps(clean_input(tool, ti), ensure_ascii=False)
+        view, short = judge_view(tool, ti, project, cwd)
+        if short:
+            entry["contents_shortened"] = True
+        args = json.dumps(view, ensure_ascii=False)
         if not prompts:
             decision, reason = "error", "no saved request for this session"
         elif len(args) > MAX_ARGS:
@@ -916,20 +1185,25 @@ def on_tool(data, project):
 
 def on_stop(data, project):
     """After the model's final answer: nothing is ever printed, so the stop is
-    never blocked. When the answer says the model declined an instruction it
-    found in content it read, one line goes to alerts.jsonl."""
+    never blocked. When Claude's text in this turn (the final answer, or text it
+    showed before it, kept by the MessageDisplay hook) says the model declined an
+    instruction it found in content it read, one line goes to alerts.jsonl. The
+    turn's files are deleted here."""
     entry = {"event": "stop", "session": data.get("session_id")}
     if data.get("stop_hook_active"):
         write_log(project, dict(entry, decision="skip", reason="stop_hook_active"))
-        return None
+        return None  # the turn goes on, so its files stay
+    sources = load_sources(data, project)  # before the reporter's seconds, not after
+    shown = take_shown(data, project)
+    clear_turn(data, project, "sources")  # the turn's files do not stay on disk
     message = data.get("last_assistant_message")
     if not isinstance(message, str) or not message.strip():
         write_log(project, dict(entry, decision="skip", reason="no last_assistant_message in the hook input"))
         return None
     prompts, entry["prompts_from"] = load_prompts(data, project)
-    sources = load_sources(data, project)  # before the reporter's seconds, not after
-    clear_sources(data, project)  # the list of what the model read does not stay on disk
-    text, _ = build_report_input(prompts, message)
+    earlier = earlier_text(shown, message, data.get("prompt_id"))
+    entry["earlier_chars"] = len(earlier)
+    text, _ = build_report_input(prompts, message, earlier)
     start = time.monotonic()
     try:
         report = run_reporter(text, project)
@@ -950,6 +1224,14 @@ def on_stop(data, project):
     return None
 
 
+def on_stop_failure(data, project):
+    """An API error ended the turn, and Stop does not run then: the turn's files
+    are deleted here. Claude Code ignores this hook's output; nothing is printed."""
+    clear_turn(data, project, "sources", "shown")
+    write_log(project, {"event": "stop_failure", "session": data.get("session_id"), "decision": "skip",
+                        "reason": "the turn ended with an API error: " + clean(data.get("error") or "")})
+
+
 def read_input():
     try:
         data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
@@ -967,8 +1249,12 @@ def main(data):
             return on_prompt(data, project)
         if event == "PreToolUse":
             return on_tool(data, project)
+        if event == "MessageDisplay":
+            return keep_shown(data, project)  # always None: the original text is shown
         if event == "Stop":
             return on_stop(data, project)  # always None: the stop is never blocked
+        if event == "StopFailure":
+            return on_stop_failure(data, project)  # always None: the output is ignored
         return None
     except Exception as e:  # fail closed: any surprise becomes a question to the user
         write_log(project, {"event": event, "decision": "error", "reason": clean(repr(e))})

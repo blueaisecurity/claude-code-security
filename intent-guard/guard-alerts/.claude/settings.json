@@ -29,6 +29,18 @@
         ]
       }
     ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["-I", "${CLAUDE_PROJECT_DIR}/.claude/hooks/intent_guard.py"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
@@ -37,6 +49,18 @@
             "command": "python",
             "args": ["-I", "${CLAUDE_PROJECT_DIR}/.claude/hooks/intent_guard.py"],
             "timeout": 60
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["-I", "${CLAUDE_PROJECT_DIR}/.claude/hooks/intent_guard.py"],
+            "timeout": 10
           }
         ]
       }
