@@ -1,8 +1,8 @@
 __pycache__/
 # what the hooks write while they run: prompts, logs, alerts
-.claude/intent-guard/
-.claude/*.log
-.claude/*.log.lock
+**/.claude/intent-guard/
+**/.claude/*.log
+**/.claude/*.log.lock
 # what the unit tests leave behind
 intent-guard/tests/tmp/
 ig-test-*/
